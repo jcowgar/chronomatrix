@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Chronomatrix
+Comment=A creative digital clock with analog clock digits
+Exec=chronomatrix
+Icon=preferences-system-time
+Terminal=false
+Type=Application
+Categories=Utility;Clock;
+Keywords=clock;time;
+StartupNotify=true

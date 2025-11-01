@@ -1,0 +1,37 @@
+# Chronomatrix Configuration
+# All colors are in hex format: #RRGGBB or #RRGGBBAA (with alpha)
+
+[colors]
+# Window background color
+window_background = "#0f0c29"
+# Active clock hand color
+clock_hand_color = "#ff6b6b"
+# Inactive clock hand color
+clock_hand_inactive = "#ff6b6b26"
+# Clock background color
+clock_bg = "#ffffff08"
+# Clock border color
+clock_border = "#ffffff1a"
+# Display container background color
+display_bg = "#ffffff0d"
+# Display container border color
+display_border = "#ffffff1a"
+# Separator dot color
+separator_color = "#ff6b6b"
+
+[window]
+# Window background opacity (0.0 - 1.0, only affects background, not clock hands)
+# Set to 0.0 for fully transparent background, 1.0 for fully opaque
+opacity = 1.0
+
+[clock]
+# Size of each individual analog clock in pixels
+size = 40
+# Stroke width for clock hands
+stroke_width = 2.0
+# Gap between clocks in pixels
+clock_gap = 1
+# Gap between digit sections
+digit_gap = 8
+# Animation duration in milliseconds for hand rotation
+animation_duration_ms = 300

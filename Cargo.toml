@@ -1,0 +1,16 @@
+[package]
+name = "chronomatrix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_6"] }
+glib = "0.20"
+cairo-rs = { version = "0.20", features = ["v1_18"] }
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+gdk4 = "0.9"
+dirs = "5.0"
+notify = "6.1"

@@ -1,0 +1,21 @@
+# direnv
+.direnv
+
+# Rust
+/target/
+Cargo.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nix
+result
+result-*
