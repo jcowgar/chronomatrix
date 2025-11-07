@@ -137,8 +137,22 @@ fn setup_config_watcher(
 ) {
     let config_path = Config::default_path();
 
-    // Get the directory to watch
-    let watch_dir = config_path.parent().map(|p| p.to_path_buf());
+    // Resolve symlinks to watch the actual target file's directory
+    let resolved_path = match std::fs::canonicalize(&config_path) {
+        Ok(path) => {
+            if path != config_path {
+                eprintln!("Config file is a symlink, watching target: {:?}", path);
+            }
+            path
+        }
+        Err(e) => {
+            eprintln!("Could not resolve config path ({}), watching symlink location instead", e);
+            config_path.clone()
+        }
+    };
+
+    // Get the directory to watch (from resolved path)
+    let watch_dir = resolved_path.parent().map(|p| p.to_path_buf());
 
     if watch_dir.is_none() {
         eprintln!("Could not determine config directory to watch");
@@ -157,8 +171,12 @@ fn setup_config_watcher(
     }));
     let reload_state_clone = reload_state.clone();
 
+    // Clone resolved_path for the thread
+    let resolved_path_for_thread = resolved_path.clone();
+
     // Spawn a thread to watch the config file
     thread::spawn(move || {
+        let resolved_path = resolved_path_for_thread;
         let mut watcher = match notify::recommended_watcher(tx) {
             Ok(w) => w,
             Err(e) => {
@@ -177,8 +195,8 @@ fn setup_config_watcher(
         loop {
             match rx.recv() {
                 Ok(Ok(event)) => {
-                    // Check if the config file was modified
-                    if is_config_file_event(&event, &config_path) {
+                    // Check if the config file was modified (using resolved path)
+                    if is_config_file_event(&event, &resolved_path) {
                         // Small delay to ensure file is written completely
                         thread::sleep(Duration::from_millis(FILE_WRITE_SETTLE_MS));
 
