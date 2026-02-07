@@ -27,7 +27,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use toml::value::Table;
+
+/// Result of loading configuration, including all source file paths for hot-reload watching.
+pub struct ConfigLoadResult {
+    pub config: Config,
+    /// All resolved file paths that contributed to this config (main + includes).
+    pub source_files: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -123,30 +131,75 @@ impl Default for ClockConfig {
 }
 
 impl Config {
-    /// Loads configuration from a TOML file.
+    /// Loads configuration from a TOML file, processing any `include` directives.
     ///
-    /// Reads and parses a TOML configuration file into a `Config` struct.
-    /// All fields use `#[serde(default)]`, so partial configs are supported.
+    /// The `include` key is an array of file paths (relative to the main config's
+    /// directory or absolute) that are loaded and deep-merged on top of the main
+    /// config. Later includes override earlier ones. Included files' own `include`
+    /// keys are stripped (no recursive includes).
     ///
     /// # Arguments
     /// * `path` - Path to the TOML configuration file
     ///
     /// # Returns
-    /// * `Ok(Config)` - Successfully loaded configuration
+    /// * `Ok(ConfigLoadResult)` - Config and all source file paths
     /// * `Err` - File not found, permission denied, or invalid TOML syntax
-    ///
-    /// # Example
-    /// ```no_run
-    /// use std::path::PathBuf;
-    /// # use chronomatrix::config::Config;
-    /// let path = PathBuf::from("~/.config/chronomatrix/config.toml");
-    /// let config = Config::load(&path)?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn load(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(path: &PathBuf) -> Result<ConfigLoadResult, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
-        Ok(config)
+        let mut table: Table = toml::from_str(&contents)?;
+
+        let base_dir = path.parent().unwrap_or(Path::new("."));
+        let mut source_files = vec![path.clone()];
+
+        // Extract and remove the `include` array before deserialization
+        if let Some(include_val) = table.remove("include") {
+            if let Some(includes) = include_val.as_array() {
+                for item in includes {
+                    if let Some(include_str) = item.as_str() {
+                        let include_path = resolve_include_path(base_dir, include_str);
+                        let canonical = match fs::canonicalize(&include_path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Could not resolve include path {:?}: {}",
+                                    include_path, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        match fs::read_to_string(&canonical) {
+                            Ok(inc_contents) => match toml::from_str::<Table>(&inc_contents) {
+                                Ok(mut inc_table) => {
+                                    // Strip any nested include keys (no recursive includes)
+                                    inc_table.remove("include");
+                                    deep_merge_toml(&mut table, inc_table);
+                                    source_files.push(canonical);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: Failed to parse include file {:?}: {}",
+                                        canonical, e
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Could not read include file {:?}: {}",
+                                    canonical, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let config: Config = toml::Value::Table(table).try_into()?;
+        Ok(ConfigLoadResult {
+            config,
+            source_files,
+        })
     }
 
     /// Returns the platform-specific default path for the config file.
@@ -158,9 +211,6 @@ impl Config {
     ///
     /// Falls back to `./chronomatrix/config.toml` if the system config directory
     /// cannot be determined.
-    ///
-    /// # Returns
-    /// PathBuf pointing to the default config location
     pub fn default_path() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("chronomatrix");
@@ -170,21 +220,47 @@ impl Config {
 
     /// Loads config from the default path, falling back to defaults if unavailable.
     ///
-    /// Attempts to load the config file from `default_path()`. If the file doesn't
-    /// exist, is unreadable, or contains invalid TOML, prints a warning to stderr
-    /// and returns `Config::default()` instead.
-    ///
-    /// This is the recommended way to load configuration in the application, as it
-    /// gracefully handles missing or invalid config files.
-    ///
-    /// # Returns
-    /// The loaded configuration, or default configuration if loading fails
-    pub fn load_or_default() -> Self {
+    /// Returns a `ConfigLoadResult` containing the config and all source file paths.
+    /// If loading fails, returns default config with just the default path as source.
+    pub fn load_or_default() -> ConfigLoadResult {
         let path = Self::default_path();
         Self::load(&path).unwrap_or_else(|_| {
             eprintln!("Could not load config from {:?}, using defaults", path);
-            Self::default()
+            ConfigLoadResult {
+                config: Self::default(),
+                source_files: vec![path],
+            }
         })
+    }
+}
+
+/// Resolves an include path relative to a base directory.
+///
+/// If the include path is absolute, it is returned as-is.
+/// If relative, it is joined to the base directory.
+pub fn resolve_include_path(base_dir: &Path, include: &str) -> PathBuf {
+    let path = Path::new(include);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+/// Deep-merges an overlay TOML table into a base table.
+///
+/// For nested tables, merges recursively. For all other value types,
+/// the overlay value replaces the base value.
+pub fn deep_merge_toml(base: &mut Table, overlay: Table) {
+    for (key, overlay_val) in overlay {
+        match (base.get_mut(&key), overlay_val.clone()) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                deep_merge_toml(base_table, overlay_table);
+            }
+            _ => {
+                base.insert(key, overlay_val);
+            }
+        }
     }
 }
 
@@ -379,5 +455,121 @@ mod tests {
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("chronomatrix"));
         assert!(path_str.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn test_deep_merge_toml_simple_override() {
+        let mut base: Table = toml::from_str(r#"key = "base""#).unwrap();
+        let overlay: Table = toml::from_str(r#"key = "overlay""#).unwrap();
+        deep_merge_toml(&mut base, overlay);
+        assert_eq!(base["key"].as_str().unwrap(), "overlay");
+    }
+
+    #[test]
+    fn test_deep_merge_toml_nested_tables() {
+        let mut base: Table = toml::from_str(
+            r##"
+            [colors]
+            window_background = "#000000"
+            clock_hand_color = "#ff0000"
+            "##,
+        )
+        .unwrap();
+        let overlay: Table = toml::from_str(
+            r##"
+            [colors]
+            window_background = "#ffffff"
+            "##,
+        )
+        .unwrap();
+        deep_merge_toml(&mut base, overlay);
+
+        let colors = base["colors"].as_table().unwrap();
+        assert_eq!(colors["window_background"].as_str().unwrap(), "#ffffff");
+        // Original key should be preserved
+        assert_eq!(colors["clock_hand_color"].as_str().unwrap(), "#ff0000");
+    }
+
+    #[test]
+    fn test_deep_merge_toml_adds_new_keys() {
+        let mut base: Table = toml::from_str(r#"a = 1"#).unwrap();
+        let overlay: Table = toml::from_str(r#"b = 2"#).unwrap();
+        deep_merge_toml(&mut base, overlay);
+        assert_eq!(base["a"].as_integer().unwrap(), 1);
+        assert_eq!(base["b"].as_integer().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_deep_merge_toml_overlay_table_replaces_scalar() {
+        let mut base: Table = toml::from_str(r#"key = "scalar""#).unwrap();
+        let overlay: Table = toml::from_str(
+            r#"
+            [key]
+            nested = "value"
+            "#,
+        )
+        .unwrap();
+        deep_merge_toml(&mut base, overlay);
+        assert!(base["key"].is_table());
+        assert_eq!(
+            base["key"].as_table().unwrap()["nested"].as_str().unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_include_path_relative() {
+        let base = Path::new("/home/user/.config/chronomatrix");
+        let result = resolve_include_path(base, "theme.toml");
+        assert_eq!(
+            result,
+            PathBuf::from("/home/user/.config/chronomatrix/theme.toml")
+        );
+    }
+
+    #[test]
+    fn test_resolve_include_path_absolute() {
+        let base = Path::new("/home/user/.config/chronomatrix");
+        let result = resolve_include_path(base, "/etc/chronomatrix/theme.toml");
+        assert_eq!(result, PathBuf::from("/etc/chronomatrix/theme.toml"));
+    }
+
+    #[test]
+    fn test_load_with_includes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("chronomatrix_test_includes");
+        let _ = fs::create_dir_all(&dir);
+
+        let main_config = dir.join("config.toml");
+        let theme_file = dir.join("theme.toml");
+
+        let mut f = fs::File::create(&theme_file).unwrap();
+        writeln!(
+            f,
+            r##"
+[colors]
+window_background = "#abcdef"
+"##
+        )
+        .unwrap();
+
+        let mut f = fs::File::create(&main_config).unwrap();
+        writeln!(
+            f,
+            r##"
+include = ["theme.toml"]
+
+[colors]
+clock_hand_color = "#112233"
+"##
+        )
+        .unwrap();
+
+        let result = Config::load(&main_config).unwrap();
+        assert_eq!(result.config.colors.window_background, "#abcdef");
+        assert_eq!(result.config.colors.clock_hand_color, "#112233");
+        assert_eq!(result.source_files.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

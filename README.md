@@ -105,10 +105,33 @@ The application reads its configuration from:
 
 - `~/.config/chronomatrix/config.toml`
 
+### Include Files
+
+You can split your configuration across multiple files using the
+`include` directive. This is useful for separating theme colors from
+layout settings, especially when using tools like
+[matugen](https://github.com/InioX/matugen) that dynamically generate
+color schemes.
+
+```toml
+# config.toml
+include = ["theme.toml"]
+
+[clock]
+size = 40
+```
+
+Included files are resolved relative to the main config file's
+directory (or as absolute paths). Later includes override earlier ones,
+and included values override the main config. Nested includes are not
+supported (an included file's own `include` key is ignored).
+
 ### Hot-Reload
 
 Configuration changes are automatically detected and applied in
 real-time. Simply edit and save your config file - no restart required.
+This includes changes to any included files — edit your `theme.toml`
+and the clock updates instantly.
 
 ### Graceful Defaults
 
@@ -190,6 +213,36 @@ animation_duration_ms = 300
 
 Remember: All settings are optional! You can include only the ones you
 want to change.
+
+### Example with Theme File
+
+Split colors into a separate theme file for easy swapping or
+auto-generation:
+
+**config.toml:**
+```toml
+include = ["theme.toml"]
+
+[window]
+opacity = 1.0
+
+[clock]
+size = 40
+animation_duration_ms = 300
+```
+
+**theme.toml:**
+```toml
+[colors]
+window_background = "#1a1b26"
+clock_hand_color = "#7aa2f7"
+clock_hand_inactive = "#7aa2f726"
+clock_bg = "#ffffff08"
+clock_border = "#7aa2f71a"
+display_bg = "#7aa2f70d"
+display_border = "#7aa2f71a"
+separator_color = "#7aa2f7"
+```
 
 ## License
 

@@ -18,9 +18,10 @@ mod digit_patterns;
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, CssProvider, gdk, glib};
-use notify::{Event, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::cell::RefCell;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,13 @@ struct ReloadState {
     last_reload: std::time::Instant,
 }
 
+/// Holds the file watcher and the set of directories currently being watched.
+/// Lives on the GTK thread so it can be mutated on reload.
+struct WatcherState {
+    watcher: RecommendedWatcher,
+    watched_dirs: HashSet<PathBuf>,
+}
+
 /// Application entry point.
 ///
 /// Creates a GTK4 application and runs it. The application is initialized with
@@ -75,8 +83,10 @@ fn main() -> glib::ExitCode {
 /// # Arguments
 /// * `app` - The GTK application instance
 fn build_ui(app: &Application) {
-    // Load configuration
-    let config = Rc::new(RefCell::new(Config::load_or_default()));
+    // Load configuration (with include support)
+    let load_result = Config::load_or_default();
+    let source_files = load_result.source_files;
+    let config = Rc::new(RefCell::new(load_result.config));
 
     // Create the main window
     let window = ApplicationWindow::builder()
@@ -106,63 +116,84 @@ fn build_ui(app: &Application) {
     // Add the clock display to the window
     window.set_child(Some(clock_display.borrow().widget()));
 
-    // Setup config file watcher
-    setup_config_watcher(window.clone(), config.clone(), clock_display.clone());
+    // Setup config file watcher (watches all source files including includes)
+    setup_config_watcher(
+        window.clone(),
+        config.clone(),
+        clock_display.clone(),
+        source_files,
+    );
 
     // Present the window
     window.present();
 }
 
+/// Resolves source file paths, canonicalizing where possible.
+fn resolve_source_files(source_files: &[PathBuf]) -> HashSet<PathBuf> {
+    source_files
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect()
+}
+
+/// Computes the unique set of parent directories for a set of file paths.
+fn parent_dirs(files: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+    files
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect()
+}
+
 /// Sets up file system watching for configuration hot-reload.
 ///
-/// Creates a background thread that monitors the config directory for file changes.
-/// When the config file is modified, it triggers a reload in the GTK main loop.
-/// Uses debouncing (300ms) to avoid multiple reloads from rapid file changes.
-///
-/// # How it works
-/// 1. Spawns a background thread with a file system watcher
-/// 2. Watches the config directory for any modifications
-/// 3. Filters events to only config file changes
-/// 4. Sets a reload flag (with timestamp for debouncing)
-/// 5. GTK main loop polls the flag every 100ms and triggers reload
+/// Watches all source files (main config + includes). The watcher lives on the GTK
+/// thread so it can be mutated on reload to watch/unwatch directories as includes change.
 ///
 /// # Arguments
 /// * `window` - The application window to update after reload
 /// * `config` - Shared reference to the config that will be updated
 /// * `clock_display` - Shared reference to the clock display to be recreated
+/// * `source_files` - Initial set of config source files to watch
 fn setup_config_watcher(
     window: ApplicationWindow,
     config: Rc<RefCell<Config>>,
     clock_display: Rc<RefCell<ClockDisplay>>,
+    source_files: Vec<PathBuf>,
 ) {
-    let config_path = Config::default_path();
-
-    // Resolve symlinks to watch the actual target file's directory
-    let resolved_path = match std::fs::canonicalize(&config_path) {
-        Ok(path) => {
-            if path != config_path {
-                eprintln!("Config file is a symlink, watching target: {:?}", path);
-            }
-            path
-        }
-        Err(e) => {
-            eprintln!("Could not resolve config path ({}), watching symlink location instead", e);
-            config_path.clone()
-        }
-    };
-
-    // Get the directory to watch (from resolved path)
-    let watch_dir = resolved_path.parent().map(|p| p.to_path_buf());
-
-    if watch_dir.is_none() {
-        eprintln!("Could not determine config directory to watch");
-        return;
-    }
-
-    let watch_dir = watch_dir.unwrap();
+    // Resolve all source files and compute directories to watch
+    let resolved_files = resolve_source_files(&source_files);
+    let dirs_to_watch = parent_dirs(&resolved_files);
 
     // Create a channel for file system events
     let (tx, rx) = channel();
+
+    // Create watcher on GTK thread
+    let mut watcher = match notify::recommended_watcher(tx) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Failed to create file watcher: {}", e);
+            return;
+        }
+    };
+
+    // Watch all directories containing source files
+    let mut watched_dirs = HashSet::new();
+    for dir in &dirs_to_watch {
+        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            eprintln!("Failed to watch directory {:?}: {}", dir, e);
+        } else {
+            watched_dirs.insert(dir.clone());
+        }
+    }
+
+    let watcher_state = Rc::new(RefCell::new(WatcherState {
+        watcher,
+        watched_dirs,
+    }));
+
+    // Shared set of watched file paths (accessed by background thread for filtering)
+    let watched_files: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(resolved_files));
+    let watched_files_for_thread = watched_files.clone();
 
     // Create a state struct to signal config reload with timestamp for debouncing
     let reload_state = Arc::new(Mutex::new(ReloadState {
@@ -171,39 +202,17 @@ fn setup_config_watcher(
     }));
     let reload_state_clone = reload_state.clone();
 
-    // Clone resolved_path for the thread
-    let resolved_path_for_thread = resolved_path.clone();
-
-    // Spawn a thread to watch the config file
+    // Spawn background thread to receive events and set the reload flag
     thread::spawn(move || {
-        let resolved_path = resolved_path_for_thread;
-        let mut watcher = match notify::recommended_watcher(tx) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("Failed to create file watcher: {}", e);
-                return;
-            }
-        };
-
-        // Watch the config directory
-        if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-            eprintln!("Failed to watch config directory: {}", e);
-            return;
-        }
-
-        // Keep the watcher alive and forward events
         loop {
             match rx.recv() {
                 Ok(Ok(event)) => {
-                    // Check if the config file was modified (using resolved path)
-                    if is_config_file_event(&event, &resolved_path) {
+                    if is_watched_file_event(&event, &watched_files_for_thread) {
                         // Small delay to ensure file is written completely
                         thread::sleep(Duration::from_millis(FILE_WRITE_SETTLE_MS));
 
-                        // Set the reload flag with debouncing
                         if let Ok(mut state) = reload_state_clone.lock() {
                             let now = std::time::Instant::now();
-                            // Only set flag if enough time has passed since last reload (debouncing)
                             if now.duration_since(state.last_reload).as_millis()
                                 > CONFIG_RELOAD_DEBOUNCE_MS
                             {
@@ -228,51 +237,58 @@ fn setup_config_watcher(
             && state.should_reload
         {
             state.should_reload = false;
-            reload_config(&window, &config, &clock_display);
+            reload_config(
+                &window,
+                &config,
+                &clock_display,
+                &watcher_state,
+                &watched_files,
+            );
         }
         glib::ControlFlow::Continue
     });
 }
 
-/// Checks if a file system event is related to the config file.
+/// Checks if a file system event involves any of the watched config files.
 ///
-/// Compares the file name from the event against the config file name.
-///
-/// # Arguments
-/// * `event` - The file system event to check
-/// * `config_path` - Path to the config file
-///
-/// # Returns
-/// `true` if the event involves the config file, `false` otherwise
-fn is_config_file_event(event: &Event, config_path: &Path) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| path.file_name() == config_path.file_name())
+/// Tries to match by canonicalized path first, falls back to matching by filename.
+fn is_watched_file_event(
+    event: &notify::Event,
+    watched_files: &Arc<Mutex<HashSet<PathBuf>>>,
+) -> bool {
+    let files = match watched_files.lock() {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    event.paths.iter().any(|event_path| {
+        // Try exact match via canonicalization
+        if let Ok(canonical) = std::fs::canonicalize(event_path) {
+            if files.contains(&canonical) {
+                return true;
+            }
+        }
+        // Fallback: match by filename against any watched file
+        if let Some(event_name) = event_path.file_name() {
+            return files.iter().any(|f| f.file_name() == Some(event_name));
+        }
+        false
+    })
 }
 
-/// Reloads the configuration and recreates the clock display.
-///
-/// This function:
-/// 1. Loads the new configuration from disk
-/// 2. Reapplies CSS with updated colors
-/// 3. Creates a new clock display with the new settings
-/// 4. Replaces the window content with the new display
-/// 5. Sets the time immediately (without animation) for accurate display
-///
-/// # Arguments
-/// * `window` - The application window to update
-/// * `config` - Shared reference to store the new config
-/// * `clock_display` - Shared reference to store the new clock display
+/// Reloads the configuration, recreates the clock display, and updates watched files/dirs.
 fn reload_config(
     window: &ApplicationWindow,
     config: &Rc<RefCell<Config>>,
     clock_display: &Rc<RefCell<ClockDisplay>>,
+    watcher_state: &Rc<RefCell<WatcherState>>,
+    watched_files: &Arc<Mutex<HashSet<PathBuf>>>,
 ) {
-    // Load new config
-    let new_config = Config::load_or_default();
+    // Load new config (with includes)
+    let load_result = Config::load_or_default();
+    let new_config = load_result.config;
 
-    // Reload CSS (this handles background opacity via CSS colors)
+    // Reload CSS
     load_css(&new_config);
 
     // Store the new config
@@ -280,14 +296,37 @@ fn reload_config(
 
     // Recreate the clock display with new config
     let new_clock_display = ClockDisplay::new(&new_config);
-    // Use immediate update to set correct angles without animation
     new_clock_display.update_time_immediate();
-
-    // Replace the old clock display widget
     window.set_child(Some(new_clock_display.widget()));
-
-    // Update the Rc to point to new display
     *clock_display.borrow_mut() = new_clock_display;
+
+    // Update watched files and directories
+    let new_resolved = resolve_source_files(&load_result.source_files);
+    let new_dirs = parent_dirs(&new_resolved);
+
+    let mut ws = watcher_state.borrow_mut();
+    let old_dirs = ws.watched_dirs.clone();
+
+    // Unwatch directories that are no longer needed
+    for dir in old_dirs.difference(&new_dirs) {
+        if let Err(e) = ws.watcher.unwatch(dir) {
+            eprintln!("Failed to unwatch {:?}: {}", dir, e);
+        }
+    }
+
+    // Watch new directories
+    for dir in new_dirs.difference(&old_dirs) {
+        if let Err(e) = ws.watcher.watch(dir, RecursiveMode::NonRecursive) {
+            eprintln!("Failed to watch {:?}: {}", dir, e);
+        }
+    }
+
+    ws.watched_dirs = new_dirs;
+
+    // Update shared file set
+    if let Ok(mut files) = watched_files.lock() {
+        *files = new_resolved;
+    }
 }
 
 /// Loads and applies CSS styling based on configuration.

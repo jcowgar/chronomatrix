@@ -1,6 +1,10 @@
 # Chronomatrix Configuration
 # All colors are in hex format: #RRGGBB or #RRGGBBAA (with alpha)
 
+# Include additional config files (relative to this file's directory or absolute).
+# Later includes override earlier ones, and includes override the main config.
+# include = ["theme.toml"]
+
 [colors]
 # Window background color
 window_background = "#0f0c29"
